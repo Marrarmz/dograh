@@ -98,15 +98,13 @@ jobs:
       - name: Redeploy on EC2 over SSH
         uses: appleboy/ssh-action@v1
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_USER: ${{ github.actor }}
           REGISTRY_NS: ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}
           IMAGE_SHA: ${{ github.sha }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: GHCR_TOKEN,GHCR_USER,REGISTRY_NS,IMAGE_SHA
+          envs: REGISTRY_NS,IMAGE_SHA
           script_stop: true
           command_timeout: 20m
           script: |
@@ -120,8 +118,12 @@ jobs:
               echo "REGISTRY=${REGISTRY_NS}" >> .env
             fi
 
-            # Authenticate root's docker (remote_up.sh runs compose as root).
-            echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+            # NOTE: no `docker login` here on purpose. The EC2 host carries a
+            # standing GHCR credential (a classic read:packages PAT logged in
+            # once via `sudo docker login ghcr.io`). Logging in here with the
+            # short-lived GITHUB_TOKEN would overwrite that credential and then
+            # expire when the job ends, breaking manual restarts. So CI relies
+            # on the host's persistent credential instead.
 
             echo "Deploying ${REGISTRY_NS}/dograh-{api,ui} @ ${IMAGE_SHA}"
             # remote_up.sh runs: docker compose --profile remote up -d
