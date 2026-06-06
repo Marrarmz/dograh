@@ -1,0 +1,131 @@
+name: Deploy to EC2
+
+# Builds the api + ui images from this fork, pushes them to GHCR, then
+# redeploys them on an EC2 host over SSH by running ./remote_up.sh there.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   EC2_HOST     public IP or DNS of the EC2 instance
+#   EC2_USER     SSH user (e.g. "ubuntu")
+#   EC2_SSH_KEY  the PRIVATE key matching the instance's key pair (full PEM)
+#
+# The instance must already be bootstrapped once (Docker installed + a
+# ~/dograh checkout with .env/certs created by scripts/setup_remote.sh).
+# See the deploy notes / your team's runbook for the one-time bootstrap.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # EC2 image architecture. linux/amd64 for Intel/AMD instances (t3, m5, c5,
+  # c6i, ...). Switch to linux/arm64 for Graviton instances (t4g, m6g, c7g,
+  # ...). It MUST match the instance you deploy to.
+  PLATFORM: linux/amd64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        service:
+          - name: dograh-api
+            dockerfile: api/Dockerfile
+          - name: dograh-ui
+            dockerfile: ui/Dockerfile
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: false
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Compute lowercase image namespace
+        id: ns
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.service.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.service.dockerfile }}
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/${{ matrix.service.name }}:latest
+            ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}/${{ matrix.service.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service.name }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute lowercase image namespace
+        id: ns
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Redeploy on EC2 over SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          REGISTRY_NS: ${{ env.REGISTRY }}/${{ steps.ns.outputs.owner }}
+          IMAGE_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: GHCR_TOKEN,GHCR_USER,REGISTRY_NS,IMAGE_SHA
+          script_stop: true
+          command_timeout: 20m
+          script: |
+            set -euo pipefail
+            cd ~/dograh
+
+            # Point docker-compose at this fork's GHCR images (idempotent).
+            if grep -q '^REGISTRY=' .env; then
+              sed -i "s#^REGISTRY=.*#REGISTRY=${REGISTRY_NS}#" .env
+            else
+              echo "REGISTRY=${REGISTRY_NS}" >> .env
+            fi
+
+            # Authenticate root's docker (remote_up.sh runs compose as root).
+            echo "${GHCR_TOKEN}" | sudo docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+
+            echo "Deploying ${REGISTRY_NS}/dograh-{api,ui} @ ${IMAGE_SHA}"
+            # remote_up.sh runs: docker compose --profile remote up -d
+            #   --pull always --force-recreate  (validates init config first)
+            sudo ./remote_up.sh
+
+            sudo docker image prune -f
